@@ -37,6 +37,10 @@ References:
   Inception v4 and Resnet V2 architectures: http://arxiv.org/abs/1602.07261
 """
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 from six.moves import xrange  # pylint: disable=redefined-builtin
 from models import model
 
@@ -44,9 +48,10 @@ from models import model
 class Inceptionv3Model(model.CNNModel):
   """InceptionV3."""
 
-  def __init__(self, auxiliary=False):
+  def __init__(self, auxiliary=False, params=None):
     self._auxiliary = auxiliary
-    super(Inceptionv3Model, self).__init__('inception3', 299, 32, 0.005)
+    super(Inceptionv3Model, self).__init__(
+        'inception3', 299, 32, 0.005, params=params)
 
   def add_inference(self, cnn):
     def inception_v3_a(cnn, n):
@@ -161,8 +166,9 @@ def inception_v4_rb(cnn):
 class Inceptionv4Model(model.CNNModel):
   """Inceptionv4."""
 
-  def __init__(self):
-    super(Inceptionv4Model, self).__init__('inception4', 299, 32, 0.005)
+  def __init__(self, params=None):
+    super(Inceptionv4Model, self).__init__(
+        'inception4', 299, 32, 0.005, params=params)
 
   def add_inference(self, cnn):
     def inception_v4_a(cnn):

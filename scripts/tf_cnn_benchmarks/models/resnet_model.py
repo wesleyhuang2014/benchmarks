@@ -30,11 +30,15 @@ References:
   Atrous Convolution, and Fully Connected CRFs
   arXiv:1606.00915 (2016)
 """
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
 import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 import datasets
+import mlperf
 from models import model as model_lib
 
 
@@ -61,6 +65,8 @@ def bottleneck_block_v1(cnn, depth, depth_bottleneck, stride):
         shortcut = cnn.apool(
             1, 1, stride, stride, input_layer=input_layer,
             num_channels_in=in_size)
+        mlperf.logger.log_projection(input_tensor=input_layer,
+                                     output_tensor=shortcut)
     else:
       shortcut = cnn.conv(
           depth, 1, 1, stride, stride, activation=None,
@@ -73,6 +79,8 @@ def bottleneck_block_v1(cnn, depth, depth_bottleneck, stride):
              use_batch_norm=True, bias=None)
     res = cnn.conv(depth, 1, 1, 1, 1, activation=None,
                    use_batch_norm=True, bias=None)
+    mlperf.logger.log(key=mlperf.tags.MODEL_HP_SHORTCUT_ADD)
+    mlperf.logger.log(key=mlperf.tags.MODEL_HP_RELU)
     output = tf.nn.relu(shortcut + res)
     cnn.top_layer = output
     cnn.top_size = depth
@@ -109,11 +117,15 @@ def bottleneck_block_v1_5(cnn, depth, depth_bottleneck, stride):
         shortcut = cnn.apool(
             1, 1, stride, stride, input_layer=input_layer,
             num_channels_in=in_size)
+        mlperf.logger.log_projection(input_tensor=input_layer,
+                                     output_tensor=shortcut)
     else:
       shortcut = cnn.conv(
           depth, 1, 1, stride, stride, activation=None,
           use_batch_norm=True, input_layer=input_layer,
           num_channels_in=in_size, bias=None)
+      mlperf.logger.log_projection(input_tensor=input_layer,
+                                   output_tensor=shortcut)
     cnn.conv(depth_bottleneck, 1, 1, 1, 1,
              input_layer=input_layer, num_channels_in=in_size,
              use_batch_norm=True, bias=None)
@@ -121,6 +133,8 @@ def bottleneck_block_v1_5(cnn, depth, depth_bottleneck, stride):
              use_batch_norm=True, bias=None)
     res = cnn.conv(depth, 1, 1, 1, 1, activation=None,
                    use_batch_norm=True, bias=None)
+    mlperf.logger.log(key=mlperf.tags.MODEL_HP_SHORTCUT_ADD)
+    mlperf.logger.log(key=mlperf.tags.MODEL_HP_RELU)
     output = tf.nn.relu(shortcut + res)
     cnn.top_layer = output
     cnn.top_size = depth
@@ -146,6 +160,7 @@ def bottleneck_block_v2(cnn, depth, depth_bottleneck, stride):
   cnn.counts[name_key] += 1
 
   preact = cnn.batch_norm()
+  mlperf.logger.log(key=mlperf.tags.MODEL_HP_RELU)
   preact = tf.nn.relu(preact)
   with tf.variable_scope(name):
     if depth == in_size:
@@ -155,6 +170,8 @@ def bottleneck_block_v2(cnn, depth, depth_bottleneck, stride):
         shortcut = cnn.apool(
             1, 1, stride, stride, input_layer=input_layer,
             num_channels_in=in_size)
+        mlperf.logger.log_projection(input_tensor=input_layer,
+                                     output_tensor=shortcut)
     else:
       shortcut = cnn.conv(
           depth, 1, 1, stride, stride, activation=None, use_batch_norm=False,
@@ -166,6 +183,7 @@ def bottleneck_block_v2(cnn, depth, depth_bottleneck, stride):
              use_batch_norm=True, bias=None)
     res = cnn.conv(depth, 1, 1, 1, 1, activation=None,
                    use_batch_norm=False, bias=None)
+    mlperf.logger.log(key=mlperf.tags.MODEL_HP_SHORTCUT_ADD)
     output = shortcut + res
     cnn.top_layer = output
     cnn.top_size = depth
@@ -181,15 +199,20 @@ def bottleneck_block(cnn, depth, depth_bottleneck, stride, version):
     stride: Stride used in the first layer of the bottleneck block.
     version: version of ResNet to build.
   """
+  mlperf.logger.log(key=mlperf.tags.MODEL_HP_BLOCK_TYPE,
+                    value=mlperf.tags.BOTTLENECK_BLOCK)
+  mlperf.logger.log_begin_block(
+      input_tensor=cnn.top_layer, block_type=mlperf.tags.BOTTLENECK_BLOCK)
   if version == 'v2':
     bottleneck_block_v2(cnn, depth, depth_bottleneck, stride)
   elif version == 'v1.5':
     bottleneck_block_v1_5(cnn, depth, depth_bottleneck, stride)
   else:
     bottleneck_block_v1(cnn, depth, depth_bottleneck, stride)
+  mlperf.logger.log_end_block(output_tensor=cnn.top_layer)
 
 
-def residual_block(cnn, depth, stride, version):
+def residual_block(cnn, depth, stride, version, projection_shortcut=False):
   """Residual block with identity short-cut.
 
   Args:
@@ -197,11 +220,19 @@ def residual_block(cnn, depth, stride, version):
     depth: the number of output filters for this residual block.
     stride: Stride used in the first layer of the residual block.
     version: version of ResNet to build.
+    projection_shortcut: indicator of using projection shortcut, even if top
+      size and depth are equal
   """
   pre_activation = True if version == 'v2' else False
   input_layer = cnn.top_layer
   in_size = cnn.top_size
-  if in_size != depth:
+
+  if projection_shortcut:
+    shortcut = cnn.conv(
+        depth, 1, 1, stride, stride, activation=None,
+        use_batch_norm=True, input_layer=input_layer,
+        num_channels_in=in_size, bias=None)
+  elif in_size != depth:
     # Plan A of shortcut.
     shortcut = cnn.apool(1, 1, stride, stride,
                          input_layer=input_layer,
@@ -238,7 +269,7 @@ def residual_block(cnn, depth, stride, version):
 class ResnetModel(model_lib.CNNModel):
   """Resnet cnn network configuration."""
 
-  def __init__(self, model, layer_counts):
+  def __init__(self, model, layer_counts, params=None):
     default_batch_sizes = {
         'resnet50': 64,
         'resnet101': 32,
@@ -251,8 +282,14 @@ class ResnetModel(model_lib.CNNModel):
         'resnet152_v2': 32,
     }
     batch_size = default_batch_sizes.get(model, 32)
-    super(ResnetModel, self).__init__(model, 224, batch_size, 0.004,
-                                      layer_counts)
+    # The ResNet paper uses a starting lr of .1 at bs=256.
+    self.base_lr_batch_size = 256
+    base_lr = 0.128
+    if params and params.resnet_base_lr:
+      base_lr = params.resnet_base_lr
+
+    super(ResnetModel, self).__init__(model, 224, batch_size, base_lr,
+                                      layer_counts, params=params)
     if 'v2' in model:
       self.version = 'v2'
     elif 'v1.5' in model:
@@ -263,6 +300,9 @@ class ResnetModel(model_lib.CNNModel):
   def add_inference(self, cnn):
     if self.layer_counts is None:
       raise ValueError('Layer counts not specified for %s' % self.get_model())
+    # Drop batch size from shape logging.
+    mlperf.logger.log(key=mlperf.tags.MODEL_HP_INITIAL_SHAPE,
+                      value=cnn.top_layer.shape.as_list()[1:])
     cnn.use_batch_norm = True
     cnn.batch_norm_config = {'decay': 0.9, 'epsilon': 1e-5, 'scale': True}
     cnn.conv(64, 7, 7, 2, 2, mode='SAME_RESNET', use_batch_norm=True)
@@ -284,46 +324,66 @@ class ResnetModel(model_lib.CNNModel):
     cnn.spatial_mean()
 
   def get_learning_rate(self, global_step, batch_size):
+    rescaled_lr = self.get_scaled_base_learning_rate(batch_size)
     num_batches_per_epoch = (
-        float(datasets.IMAGENET_NUM_TRAIN_IMAGES) / batch_size)
+        datasets.IMAGENET_NUM_TRAIN_IMAGES / batch_size)
     boundaries = [int(num_batches_per_epoch * x) for x in [30, 60, 80, 90]]
-    rescaled_lr = self.learning_rate / self.default_batch_size * batch_size
     values = [1, 0.1, 0.01, 0.001, 0.0001]
     values = [rescaled_lr * v for v in values]
     lr = tf.train.piecewise_constant(global_step, boundaries, values)
     warmup_steps = int(num_batches_per_epoch * 5)
+    mlperf.logger.log(key=mlperf.tags.OPT_LR_WARMUP_STEPS, value=warmup_steps)
     warmup_lr = (
         rescaled_lr * tf.cast(global_step, tf.float32) / tf.cast(
             warmup_steps, tf.float32))
     return tf.cond(global_step < warmup_steps, lambda: warmup_lr, lambda: lr)
 
+  def get_scaled_base_learning_rate(self, batch_size):
+    """Calculates base learning rate for creating lr schedule.
 
-def create_resnet50_model():
-  return ResnetModel('resnet50', (3, 4, 6, 3))
+    In replicated mode, gradients are summed rather than averaged which, with
+    the sgd and momentum optimizers, increases the effective learning rate by
+    lr * num_gpus. Dividing the base lr by num_gpus negates the increase.
 
+    Args:
+      batch_size: Total batch-size.
 
-def create_resnet50_v1_5_model():
-  return ResnetModel('resnet50_v1.5', (3, 4, 6, 3))
-
-
-def create_resnet50_v2_model():
-  return ResnetModel('resnet50_v2', (3, 4, 6, 3))
-
-
-def create_resnet101_model():
-  return ResnetModel('resnet101', (3, 4, 23, 3))
-
-
-def create_resnet101_v2_model():
-  return ResnetModel('resnet101_v2', (3, 4, 23, 3))
-
-
-def create_resnet152_model():
-  return ResnetModel('resnet152', (3, 8, 36, 3))
+    Returns:
+      Base learning rate to use to create lr schedule.
+    """
+    base_lr = self.learning_rate
+    if self.params.variable_update == 'replicated':
+      base_lr = self.learning_rate / self.params.num_gpus
+    scaled_lr = base_lr * (batch_size / self.base_lr_batch_size)
+    return scaled_lr
 
 
-def create_resnet152_v2_model():
-  return ResnetModel('resnet152_v2', (3, 8, 36, 3))
+def create_resnet50_model(params):
+  return ResnetModel('resnet50', (3, 4, 6, 3), params=params)
+
+
+def create_resnet50_v1_5_model(params):
+  return ResnetModel('resnet50_v1.5', (3, 4, 6, 3), params=params)
+
+
+def create_resnet50_v2_model(params):
+  return ResnetModel('resnet50_v2', (3, 4, 6, 3), params=params)
+
+
+def create_resnet101_model(params):
+  return ResnetModel('resnet101', (3, 4, 23, 3), params=params)
+
+
+def create_resnet101_v2_model(params):
+  return ResnetModel('resnet101_v2', (3, 4, 23, 3), params=params)
+
+
+def create_resnet152_model(params):
+  return ResnetModel('resnet152', (3, 8, 36, 3), params=params)
+
+
+def create_resnet152_v2_model(params):
+  return ResnetModel('resnet152_v2', (3, 8, 36, 3), params=params)
 
 
 class ResnetCifar10Model(model_lib.CNNModel):
@@ -336,13 +396,13 @@ class ResnetCifar10Model(model_lib.CNNModel):
   https://arxiv.org/pdf/1603.05027.pdf.
   """
 
-  def __init__(self, model, layer_counts):
+  def __init__(self, model, layer_counts, params=None):
     if 'v2' in model:
       self.version = 'v2'
     else:
       self.version = 'v1'
     super(ResnetCifar10Model, self).__init__(
-        model, 32, 128, 0.1, layer_counts)
+        model, 32, 128, 0.1, layer_counts, params=params)
 
   def add_inference(self, cnn):
     if self.layer_counts is None:
@@ -380,41 +440,41 @@ class ResnetCifar10Model(model_lib.CNNModel):
     return tf.train.piecewise_constant(global_step, boundaries, values)
 
 
-def create_resnet20_cifar_model():
-  return ResnetCifar10Model('resnet20', (3, 3, 3))
+def create_resnet20_cifar_model(params):
+  return ResnetCifar10Model('resnet20', (3, 3, 3), params=params)
 
 
-def create_resnet20_v2_cifar_model():
-  return ResnetCifar10Model('resnet20_v2', (3, 3, 3))
+def create_resnet20_v2_cifar_model(params):
+  return ResnetCifar10Model('resnet20_v2', (3, 3, 3), params=params)
 
 
-def create_resnet32_cifar_model():
-  return ResnetCifar10Model('resnet32', (5, 5, 5))
+def create_resnet32_cifar_model(params):
+  return ResnetCifar10Model('resnet32', (5, 5, 5), params=params)
 
 
-def create_resnet32_v2_cifar_model():
-  return ResnetCifar10Model('resnet32_v2', (5, 5, 5))
+def create_resnet32_v2_cifar_model(params):
+  return ResnetCifar10Model('resnet32_v2', (5, 5, 5), params=params)
 
 
-def create_resnet44_cifar_model():
-  return ResnetCifar10Model('resnet44', (7, 7, 7))
+def create_resnet44_cifar_model(params):
+  return ResnetCifar10Model('resnet44', (7, 7, 7), params=params)
 
 
-def create_resnet44_v2_cifar_model():
-  return ResnetCifar10Model('resnet44_v2', (7, 7, 7))
+def create_resnet44_v2_cifar_model(params):
+  return ResnetCifar10Model('resnet44_v2', (7, 7, 7), params=params)
 
 
-def create_resnet56_cifar_model():
-  return ResnetCifar10Model('resnet56', (9, 9, 9))
+def create_resnet56_cifar_model(params):
+  return ResnetCifar10Model('resnet56', (9, 9, 9), params=params)
 
 
-def create_resnet56_v2_cifar_model():
-  return ResnetCifar10Model('resnet56_v2', (9, 9, 9))
+def create_resnet56_v2_cifar_model(params):
+  return ResnetCifar10Model('resnet56_v2', (9, 9, 9), params=params)
 
 
-def create_resnet110_cifar_model():
-  return ResnetCifar10Model('resnet110', (18, 18, 18))
+def create_resnet110_cifar_model(params):
+  return ResnetCifar10Model('resnet110', (18, 18, 18), params=params)
 
 
-def create_resnet110_v2_cifar_model():
-  return ResnetCifar10Model('resnet110_v2', (18, 18, 18))
+def create_resnet110_v2_cifar_model(params):
+  return ResnetCifar10Model('resnet110_v2', (18, 18, 18), params=params)

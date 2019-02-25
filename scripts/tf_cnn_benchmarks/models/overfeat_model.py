@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
 """Overfeat model configuration.
 
 References:
@@ -23,14 +22,19 @@ References:
   http://arxiv.org/abs/1312.6229
 """
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 from models import model
 
 
 class OverfeatModel(model.CNNModel):
   """OverfeatModel."""
 
-  def __init__(self):
-    super(OverfeatModel, self).__init__('overfeat', 231, 32, 0.005)
+  def __init__(self, params=None):
+    super(OverfeatModel, self).__init__(
+        'overfeat', 231, 32, 0.005, params=params)
 
   def add_inference(self, cnn):
     # Note: VALID requires padding the images by 3 in width and height

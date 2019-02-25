@@ -15,15 +15,24 @@
 
 """Image pre-processing utilities.
 """
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import math
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 
+import cnn_util
+from tensorflow.contrib.data.python.ops import threadpool
 from tensorflow.contrib.image.python.ops import distort_image_ops
+from tensorflow.python.data.ops import multi_device_iterator_ops
+from tensorflow.python.framework import function
 from tensorflow.python.layers import utils
 from tensorflow.python.ops import data_flow_ops
-import cnn_util
-import data_utils
+from tensorflow.python.platform import gfile
+import mlperf
 
 
 def parse_example_proto(example_serialized):
@@ -172,10 +181,17 @@ def decode_jpeg(image_buffer, scope=None):  # , dtype=tf.float32):
     return image
 
 
+_R_MEAN = 123.68
+_G_MEAN = 116.78
+_B_MEAN = 103.94
+_CHANNEL_MEANS = [_R_MEAN, _G_MEAN, _B_MEAN]
+
+
 def normalized_image(images):
   # Rescale from [0, 255] to [0, 2]
   images = tf.multiply(images, 1. / 127.5)
   # Rescale to [-1, 1]
+  mlperf.logger.log(key=mlperf.tags.INPUT_MEAN_SUBTRACTION, value=[1.0] * 3)
   return tf.subtract(images, 1.0)
 
 
@@ -188,10 +204,10 @@ def eval_image(image,
   """Get the image for model evaluation.
 
   We preprocess the image simiarly to Slim, see
-  https://github.com/tensorflow/models/blob/master/slim/preprocessing/vgg_preprocessing.py
+  https://github.com/tensorflow/models/blob/master/research/slim/preprocessing/vgg_preprocessing.py
   Validation images do not have bounding boxes, so to crop the image, we first
   resize the image such that the aspect ratio is maintained and the resized
-  height and width are both at least 1.15 times `height` and `width`
+  height and width are both at least 1.145 times `height` and `width`
   respectively. Then, we do a central crop to size (`height`, `width`).
 
   Args:
@@ -222,7 +238,10 @@ def eval_image(image,
     image_height_float = tf.cast(image_height, tf.float32)
     image_width_float = tf.cast(image_width, tf.float32)
 
-    scale_factor = 1.15
+    # This value is chosen so that in resnet, images are cropped to a size of
+    # 256 x 256, which matches what other implementations do. The final image
+    # size for resnet is 224 x 224, and floor(224 * 1.145) = 256.
+    scale_factor = 1.145
 
     # Compute resize_height and resize_width to be the minimum values such that
     #   1. The aspect ratio is maintained (i.e. resize_height / resize_width is
@@ -235,6 +254,8 @@ def eval_image(image,
                             tf.int32)
     resize_width = tf.cast(image_width_float * max_ratio * scale_factor,
                            tf.int32)
+    mlperf.logger.log_input_resize_aspect_preserving(height, width,
+                                                     scale_factor)
 
     # Resize the image to shape (`resize_height`, `resize_width`)
     image_resize_method = get_image_resize_method(resize_method, batch_position)
@@ -244,6 +265,9 @@ def eval_image(image,
                                              align_corners=False)
 
     # Do a central crop of the image to size (height, width).
+    # MLPerf requires us to log (height, width) with two different keys.
+    mlperf.logger.log(key=mlperf.tags.INPUT_CENTRAL_CROP, value=[height, width])
+    mlperf.logger.log(key=mlperf.tags.INPUT_RESIZE, value=[height, width])
     total_crop_height = (resize_height - height)
     crop_top = total_crop_height // 2
     total_crop_width = (resize_width - width)
@@ -306,13 +330,26 @@ def train_image(image_buffer,
     # allowed range of aspect ratios, sizes and overlap with the human-annotated
     # bounding box. If no box is supplied, then we assume the bounding box is
     # the entire image.
+    min_object_covered = 0.1
+    aspect_ratio_range = [0.75, 1.33]
+    area_range = [0.05, 1.0]
+    max_attempts = 100
+    mlperf.logger.log(key=mlperf.tags.INPUT_DISTORTED_CROP_MIN_OBJ_COV,
+                      value=min_object_covered)
+    mlperf.logger.log(key=mlperf.tags.INPUT_DISTORTED_CROP_RATIO_RANGE,
+                      value=aspect_ratio_range)
+    mlperf.logger.log(key=mlperf.tags.INPUT_DISTORTED_CROP_AREA_RANGE,
+                      value=area_range)
+    mlperf.logger.log(key=mlperf.tags.INPUT_DISTORTED_CROP_MAX_ATTEMPTS,
+                      value=max_attempts)
+
     sample_distorted_bounding_box = tf.image.sample_distorted_bounding_box(
         tf.image.extract_jpeg_shape(image_buffer),
         bounding_boxes=bbox,
-        min_object_covered=0.1,
-        aspect_ratio_range=[0.75, 1.33],
-        area_range=[0.05, 1.0],
-        max_attempts=100,
+        min_object_covered=min_object_covered,
+        aspect_ratio_range=aspect_ratio_range,
+        area_range=area_range,
+        max_attempts=max_attempts,
         use_image_if_no_bounding_boxes=True)
     bbox_begin, bbox_size, distort_bbox = sample_distorted_bounding_box
     if summary_verbosity >= 3:
@@ -337,10 +374,12 @@ def train_image(image_buffer,
                                    dct_method='INTEGER_FAST')
       image = tf.slice(image, bbox_begin, bbox_size)
 
+    mlperf.logger.log(key=mlperf.tags.INPUT_RANDOM_FLIP)
     distorted_image = tf.image.random_flip_left_right(image)
 
     # This resizing operation may distort the images because the aspect
     # ratio is not respected.
+    mlperf.logger.log(key=mlperf.tags.INPUT_RESIZE, value=[height, width])
     image_resize_method = get_image_resize_method(resize_method, batch_position)
     distorted_image = tf.image.resize_images(
         distorted_image, [height, width],
@@ -425,13 +464,132 @@ def distort_color(image, batch_position=0, distort_color_in_yiq=False,
     return image
 
 
-class BaseImagePreprocess(object):
-  """Base class for all image preprocessors."""
+class InputPreprocessor(object):
+  """Base class for all model preprocessors."""
+
+  def __init__(self, batch_size, output_shapes):
+    self.batch_size = batch_size
+    self.output_shapes = output_shapes
+
+  def supports_datasets(self):
+    """Whether this preprocessor supports dataset."""
+    return False
+
+  def minibatch(self, dataset, subset, params, shift_ratio=-1):
+    """Returns tensors representing a minibatch of all the input."""
+    raise NotImplementedError('Must be implemented by subclass.')
+
+  # The methods added below are only supported/used if supports_datasets()
+  # returns True.
+  # TODO(laigd): refactor benchmark_cnn.py and put the logic of
+  # _build_input_processing() into InputPreprocessor.
+
+  def parse_and_preprocess(self, value, batch_position):
+    """Function to parse and preprocess an Example proto in input pipeline."""
+    raise NotImplementedError('Must be implemented by subclass.')
+
+  # TODO(laigd): figure out how to remove these parameters, since the
+  # preprocessor itself has self.batch_size, self.num_splits, etc defined.
+  def build_multi_device_iterator(self, batch_size, num_splits, cpu_device,
+                                  params, gpu_devices, dataset, doing_eval):
+    """Creates a MultiDeviceIterator."""
+    assert self.supports_datasets()
+    assert num_splits == len(gpu_devices)
+    with tf.name_scope('batch_processing'):
+      if doing_eval:
+        subset = 'validation'
+      else:
+        subset = 'train'
+      batch_size_per_split = batch_size // num_splits
+      ds = self.create_dataset(
+          batch_size,
+          num_splits,
+          batch_size_per_split,
+          dataset,
+          subset,
+          train=(not doing_eval),
+          datasets_repeat_cached_sample=params.datasets_repeat_cached_sample,
+          num_threads=params.datasets_num_private_threads,
+          datasets_use_caching=params.datasets_use_caching,
+          datasets_parallel_interleave_cycle_length=(
+              params.datasets_parallel_interleave_cycle_length),
+          datasets_sloppy_parallel_interleave=(
+              params.datasets_sloppy_parallel_interleave),
+          datasets_parallel_interleave_prefetch=(
+              params.datasets_parallel_interleave_prefetch))
+      multi_device_iterator = multi_device_iterator_ops.MultiDeviceIterator(
+          ds,
+          gpu_devices,
+          source_device=cpu_device,
+          max_buffer_size=params.multi_device_iterator_max_buffer_size)
+      tf.add_to_collection(tf.GraphKeys.TABLE_INITIALIZERS,
+                           multi_device_iterator.initializer)
+      return multi_device_iterator
+
+  def create_dataset(self,
+                     batch_size,
+                     num_splits,
+                     batch_size_per_split,
+                     dataset,
+                     subset,
+                     train,
+                     datasets_repeat_cached_sample,
+                     num_threads=None,
+                     datasets_use_caching=False,
+                     datasets_parallel_interleave_cycle_length=None,
+                     datasets_sloppy_parallel_interleave=False,
+                     datasets_parallel_interleave_prefetch=None):
+    """Creates a dataset for the benchmark."""
+    raise NotImplementedError('Must be implemented by subclass.')
+
+  def create_iterator(self, ds):
+    ds_iterator = ds.make_initializable_iterator()
+    tf.add_to_collection(tf.GraphKeys.TABLE_INITIALIZERS,
+                         ds_iterator.initializer)
+    return ds_iterator
+
+  def minibatch_fn(self, batch_size, model_input_shapes, num_splits,
+                   dataset, subset, train, datasets_repeat_cached_sample,
+                   num_threads, datasets_use_caching,
+                   datasets_parallel_interleave_cycle_length,
+                   datasets_sloppy_parallel_interleave,
+                   datasets_parallel_interleave_prefetch):
+    """Returns a function and list of args for the fn to create a minibatch."""
+    assert self.supports_datasets()
+    batch_size_per_split = batch_size // num_splits
+    assert batch_size_per_split == model_input_shapes[0][0]
+    with tf.name_scope('batch_processing'):
+      ds = self.create_dataset(batch_size, num_splits, batch_size_per_split,
+                               dataset, subset, train,
+                               datasets_repeat_cached_sample, num_threads,
+                               datasets_use_caching,
+                               datasets_parallel_interleave_cycle_length,
+                               datasets_sloppy_parallel_interleave,
+                               datasets_parallel_interleave_prefetch)
+      ds_iterator = self.create_iterator(ds)
+
+      ds_iterator_string_handle = ds_iterator.string_handle()
+
+      @function.Defun(tf.string)
+      def _fn(h):
+        remote_iterator = tf.data.Iterator.from_string_handle(
+            h, ds_iterator.output_types, ds_iterator.output_shapes)
+        input_list = remote_iterator.get_next()
+        reshaped_input_list = [
+            tf.reshape(input_list[i], shape=model_input_shapes[i])
+            for i in range(len(input_list))
+        ]
+        return reshaped_input_list
+
+      return _fn, [ds_iterator_string_handle]
+
+
+class BaseImagePreprocessor(InputPreprocessor):
+  """Base class for all image model preprocessors."""
 
   def __init__(self,
-               height,
-               width,
                batch_size,
+               output_shapes,
                num_splits,
                dtype,
                train,
@@ -441,10 +599,13 @@ class BaseImagePreprocess(object):
                summary_verbosity=0,
                distort_color_in_yiq=True,
                fuse_decode_and_crop=True,
-               depth=3):
-    self.height = height
-    self.width = width
-    self.batch_size = batch_size
+               match_mlperf=False):
+    super(BaseImagePreprocessor, self).__init__(batch_size, output_shapes)
+    image_shape = output_shapes[0]
+    # image_shape is in form (batch_size, height, width, depth)
+    self.height = image_shape[1]
+    self.width = image_shape[2]
+    self.depth = image_shape[3]
     self.num_splits = num_splits
     self.dtype = dtype
     self.train = train
@@ -460,20 +621,80 @@ class BaseImagePreprocess(object):
           (self.batch_size, self.num_splits))
     self.batch_size_per_split = self.batch_size // self.num_splits
     self.summary_verbosity = summary_verbosity
-    self.depth = depth
+    self.match_mlperf = match_mlperf
+
+  def parse_and_preprocess(self, value, batch_position):
+    assert self.supports_datasets()
+    image_buffer, label_index, bbox, _ = parse_example_proto(value)
+    if self.match_mlperf:
+      bbox = tf.zeros((1, 0, 4), dtype=bbox.dtype)
+      mlperf.logger.log(key=mlperf.tags.INPUT_CROP_USES_BBOXES, value=False)
+    else:
+      mlperf.logger.log(key=mlperf.tags.INPUT_CROP_USES_BBOXES, value=True)
+    image = self.preprocess(image_buffer, bbox, batch_position)
+    return (image, label_index)
 
   def preprocess(self, image_buffer, bbox, batch_position):
     raise NotImplementedError('Must be implemented by subclass.')
 
-  def minibatch(self, dataset, subset, use_datasets, cache_data,
-                shift_ratio):
-    raise NotImplementedError('Must be implemented by subclass.')
+  def create_dataset(self,
+                     batch_size,
+                     num_splits,
+                     batch_size_per_split,
+                     dataset,
+                     subset,
+                     train,
+                     datasets_repeat_cached_sample,
+                     num_threads=None,
+                     datasets_use_caching=False,
+                     datasets_parallel_interleave_cycle_length=None,
+                     datasets_sloppy_parallel_interleave=False,
+                     datasets_parallel_interleave_prefetch=None):
+    """Creates a dataset for the benchmark."""
+    assert self.supports_datasets()
+    glob_pattern = dataset.tf_record_pattern(subset)
+    file_names = gfile.Glob(glob_pattern)
+    if not file_names:
+      raise ValueError('Found no files in --data_dir matching: {}'
+                       .format(glob_pattern))
+    ds = tf.data.TFRecordDataset.list_files(file_names, shuffle=train)
+    ds = ds.apply(
+        tf.data.experimental.parallel_interleave(
+            tf.data.TFRecordDataset,
+            cycle_length=datasets_parallel_interleave_cycle_length or 10,
+            sloppy=datasets_sloppy_parallel_interleave,
+            prefetch_input_elements=datasets_parallel_interleave_prefetch))
+    if datasets_repeat_cached_sample:
+      # Repeat a single sample element indefinitely to emulate memory-speed IO.
+      ds = ds.take(1).cache().repeat()
+    counter = tf.data.Dataset.range(batch_size)
+    counter = counter.repeat()
+    ds = tf.data.Dataset.zip((ds, counter))
+    ds = ds.prefetch(buffer_size=batch_size)
+    if datasets_use_caching:
+      ds = ds.cache()
+    if train:
+      buffer_size = 10000
+      mlperf.logger.log(key=mlperf.tags.INPUT_SHARD, value=buffer_size)
+      ds = ds.apply(
+          tf.data.experimental.shuffle_and_repeat(buffer_size=buffer_size))
+    else:
+      ds = ds.repeat()
+    ds = ds.apply(
+        tf.data.experimental.map_and_batch(
+            map_func=self.parse_and_preprocess,
+            batch_size=batch_size_per_split,
+            num_parallel_batches=num_splits))
+    ds = ds.prefetch(buffer_size=num_splits)
+    if num_threads:
+      ds = threadpool.override_threadpool(
+          ds,
+          threadpool.PrivateThreadPool(
+              num_threads, display_name='input_pipeline_thread_pool'))
+    return ds
 
-  def supports_datasets(self):
-    return False
 
-
-class RecordInputImagePreprocessor(BaseImagePreprocess):
+class RecordInputImagePreprocessor(BaseImagePreprocessor):
   """Preprocessor for images with RecordInput format."""
 
   def preprocess(self, image_buffer, bbox, batch_position):
@@ -494,15 +715,18 @@ class RecordInputImagePreprocessor(BaseImagePreprocess):
 
     # image = tf.cast(image, tf.uint8) # HACK TESTING
 
-    normalized = normalized_image(image)
+    if self.match_mlperf:
+      mlperf.logger.log(key=mlperf.tags.INPUT_MEAN_SUBTRACTION,
+                        value=_CHANNEL_MEANS)
+      normalized = image - _CHANNEL_MEANS
+    else:
+      normalized = normalized_image(image)
     return tf.cast(normalized, self.dtype)
 
-  def parse_and_preprocess(self, value, batch_position):
-    image_buffer, label_index, bbox, _ = parse_example_proto(value)
-    image = self.preprocess(image_buffer, bbox, batch_position)
-    return (label_index, image)
-
-  def minibatch(self, dataset, subset, use_datasets, cache_data,
+  def minibatch(self,
+                dataset,
+                subset,
+                params,
                 shift_ratio=-1):
     if shift_ratio < 0:
       shift_ratio = self.shift_ratio
@@ -510,14 +734,25 @@ class RecordInputImagePreprocessor(BaseImagePreprocess):
       # Build final results per split.
       images = [[] for _ in range(self.num_splits)]
       labels = [[] for _ in range(self.num_splits)]
-      if use_datasets:
-        ds = data_utils.create_dataset(
+      if params.use_datasets:
+        ds = self.create_dataset(
             self.batch_size, self.num_splits, self.batch_size_per_split,
-            self.parse_and_preprocess, dataset, subset, self.train, cache_data)
-        ds_iterator = data_utils.create_iterator(ds)
+            dataset, subset, self.train,
+            datasets_repeat_cached_sample=params.datasets_repeat_cached_sample,
+            num_threads=params.datasets_num_private_threads,
+            datasets_use_caching=params.datasets_use_caching,
+            datasets_parallel_interleave_cycle_length=(
+                params.datasets_parallel_interleave_cycle_length),
+            datasets_sloppy_parallel_interleave=(
+                params.datasets_sloppy_parallel_interleave),
+            datasets_parallel_interleave_prefetch=(
+                params.datasets_parallel_interleave_prefetch))
+        ds_iterator = self.create_iterator(ds)
         for d in xrange(self.num_splits):
-          labels[d], images[d] = ds_iterator.get_next()
+          images[d], labels[d] = ds_iterator.get_next()
 
+      # TODO(laigd): consider removing the --use_datasets option, it should
+      # always use datasets.
       else:
         record_input = data_flow_ops.RecordInput(
             file_pattern=dataset.tf_record_pattern(subset),
@@ -532,13 +767,13 @@ class RecordInputImagePreprocessor(BaseImagePreprocess):
         records = [tf.reshape(record, []) for record in records]
         for idx in xrange(self.batch_size):
           value = records[idx]
-          (label, image) = self.parse_and_preprocess(value, idx)
+          (image, label) = self.parse_and_preprocess(value, idx)
           split_index = idx % self.num_splits
           labels[split_index].append(label)
           images[split_index].append(image)
 
       for split_index in xrange(self.num_splits):
-        if not use_datasets:
+        if not params.use_datasets:
           images[split_index] = tf.parallel_stack(images[split_index])
           labels[split_index] = tf.concat(labels[split_index], 0)
         images[split_index] = tf.reshape(
@@ -573,7 +808,7 @@ class ImagenetPreprocessor(RecordInputImagePreprocessor):
     return tf.cast(image, self.dtype)
 
 
-class Cifar10ImagePreprocessor(BaseImagePreprocess):
+class Cifar10ImagePreprocessor(BaseImagePreprocessor):
   """Preprocessor for Cifar10 input images."""
 
   def _distort_image(self, image):
@@ -618,10 +853,13 @@ class Cifar10ImagePreprocessor(BaseImagePreprocess):
     normalized = normalized_image(image)
     return tf.cast(normalized, self.dtype)
 
-  def minibatch(self, dataset, subset, use_datasets, cache_data,
+  def minibatch(self,
+                dataset,
+                subset,
+                params,
                 shift_ratio=-1):
     # TODO(jsimsa): Implement datasets code path
-    del use_datasets, cache_data, shift_ratio
+    del shift_ratio, params
     with tf.name_scope('batch_processing'):
       all_images, all_labels = dataset.read_data_files(subset)
       all_images = tf.constant(all_images)
@@ -665,40 +903,187 @@ class Cifar10ImagePreprocessor(BaseImagePreprocess):
       return images, labels
 
 
-class SyntheticImagePreprocessor(BaseImagePreprocess):
-  """Preprocessor used for images and labels."""
+class COCOPreprocessor(BaseImagePreprocessor):
+  """Preprocessor for COCO dataset input images, boxes, and labels."""
 
-  def minibatch(self, dataset, subset, use_datasets, cache_data,
+  def minibatch(self,
+                dataset,
+                subset,
+                params,
                 shift_ratio=-1):
-    """Get synthetic image batches."""
-    del subset, use_datasets, cache_data, shift_ratio
-    input_shape = [self.batch_size, self.height, self.width, self.depth]
-    images = tf.truncated_normal(
-        input_shape,
-        dtype=self.dtype,
-        stddev=1e-1,
-        name='synthetic_images')
-    labels = tf.random_uniform(
-        [self.batch_size],
-        minval=0,
-        maxval=dataset.num_classes - 1,
-        dtype=tf.int32,
-        name='synthetic_labels')
-    # Note: This results in a H2D copy, but no computation
-    # Note: This avoids recomputation of the random values, but still
-    #         results in a H2D copy.
-    images = tf.contrib.framework.local_variable(images, name='images')
-    labels = tf.contrib.framework.local_variable(labels, name='labels')
-    if self.num_splits == 1:
-      images_splits = [images]
-      labels_splits = [labels]
+    del shift_ratio  # Not used when using datasets instead of data_flow_ops
+    with tf.name_scope('batch_processing'):
+      ds = self.create_dataset(
+          self.batch_size, self.num_splits, self.batch_size_per_split,
+          dataset, subset, self.train, params.datasets_repeat_cached_sample)
+      ds_iterator = self.create_iterator(ds)
+
+      # Training data: 4 tuple
+      # Validation data: 5 tuple
+      # See get_input_shapes in models/ssd_model.py for details.
+      input_len = 4 if subset == 'train' else 5
+      input_lists = [[None for _ in range(self.num_splits)]
+                     for _ in range(input_len)]
+      for d in xrange(self.num_splits):
+        input_list = ds_iterator.get_next()
+        for i in range(input_len):
+          input_lists[i][d] = input_list[i]
+      return input_lists
+
+  def preprocess(self, data):
+    try:
+      import ssd_dataloader  # pylint: disable=g-import-not-at-top
+      import ssd_constants  # pylint: disable=g-import-not-at-top
+      from object_detection.core import preprocessor  # pylint: disable=g-import-not-at-top
+    except ImportError:
+      raise ImportError('To use the COCO dataset, you must clone the '
+                        'repo https://github.com/tensorflow/models and add '
+                        'tensorflow/models and tensorflow/models/research to '
+                        'the PYTHONPATH, and compile the protobufs by '
+                        'following https://github.com/tensorflow/models/blob/'
+                        'master/research/object_detection/g3doc/installation.md'
+                        '#protobuf-compilation')
+    image_buffer = data['image_buffer']
+    boxes = data['groundtruth_boxes']
+    classes = tf.reshape(data['groundtruth_classes'], [-1, 1])
+    source_id = tf.string_to_number(data['source_id'])
+    raw_shape = data['raw_shape']
+
+    ssd_encoder = ssd_dataloader.Encoder()
+
+    # Only 80 of the 90 COCO classes are used.
+    class_map = tf.convert_to_tensor(ssd_constants.CLASS_MAP)
+    classes = tf.gather(class_map, classes)
+    classes = tf.cast(classes, dtype=tf.float32)
+
+    if self.train:
+      image, boxes, classes = ssd_dataloader.ssd_decode_and_crop(
+          image_buffer, boxes, classes, raw_shape)
+      # ssd_crop resizes and returns image of dtype float32 and does not change
+      # its range (i.e., value in between 0--255). Divide by 255. converts it
+      # to [0, 1] range. Not doing this before cropping to avoid dtype cast
+      # (which incurs additional memory copy).
+      image /= 255.
+
+      image, boxes = preprocessor.random_horizontal_flip(
+          image=image, boxes=boxes)
+      # Random horizontal flip probability is 50%
+      # See https://github.com/tensorflow/models/blob/master/research/object_detection/core/preprocessor.py  # pylint: disable=line-too-long
+      mlperf.logger.log(key=mlperf.tags.RANDOM_FLIP_PROBABILITY, value=0.5)
+
+      image = tf.cast(image, self.dtype)
+
+      encoded_returns = ssd_encoder.encode_labels(boxes, classes)
+      encoded_classes, encoded_boxes, num_matched_boxes = encoded_returns
+
+      # Shape of image: [width, height, channel]
+      # Shape of encoded_boxes: [NUM_SSD_BOXES, 4]
+      # Shape of encoded_classes: [NUM_SSD_BOXES, 1]
+      # Shape of num_matched_boxes: [1]
+      return (image, encoded_boxes, encoded_classes, num_matched_boxes)
+
     else:
-      images_splits = tf.split(images, self.num_splits, 0)
-      labels_splits = tf.split(labels, self.num_splits, 0)
-    return images_splits, labels_splits
+      image = tf.image.decode_jpeg(image_buffer)
+      image = tf.image.resize_images(
+          image, size=(ssd_constants.IMAGE_SIZE, ssd_constants.IMAGE_SIZE))
+      # resize_image returns image of dtype float32 and does not change its
+      # range. Divide by 255 to convert image to [0, 1] range.
+      image /= 255.
+
+      image = ssd_dataloader.normalize_image(image)
+      image = tf.cast(image, self.dtype)
+
+      def trim_and_pad(inp_tensor):
+        """Limit the number of boxes, and pad if necessary."""
+        inp_tensor = inp_tensor[:ssd_constants.MAX_NUM_EVAL_BOXES]
+        num_pad = ssd_constants.MAX_NUM_EVAL_BOXES - tf.shape(inp_tensor)[0]
+        inp_tensor = tf.pad(inp_tensor, [[0, num_pad], [0, 0]])
+        return tf.reshape(inp_tensor, [ssd_constants.MAX_NUM_EVAL_BOXES,
+                                       inp_tensor.get_shape()[1]])
+
+      boxes, classes = trim_and_pad(boxes), trim_and_pad(classes)
+
+      # Shape of boxes: [MAX_NUM_EVAL_BOXES, 4]
+      # Shape of classes: [MAX_NUM_EVAL_BOXES, 1]
+      # Shape of source_id: [] (scalar tensor)
+      # Shape of raw_shape: [3]
+      return (image, boxes, classes, source_id, raw_shape)
+
+  def create_dataset(self,
+                     batch_size,
+                     num_splits,
+                     batch_size_per_split,
+                     dataset,
+                     subset,
+                     train,
+                     datasets_repeat_cached_sample,
+                     num_threads=None,
+                     datasets_use_caching=False,
+                     datasets_parallel_interleave_cycle_length=None,
+                     datasets_sloppy_parallel_interleave=False,
+                     datasets_parallel_interleave_prefetch=None):
+    """Creates a dataset for the benchmark."""
+    try:
+      import ssd_dataloader  # pylint: disable=g-import-not-at-top
+    except ImportError:
+      raise ImportError('To use the COCO dataset, you must clone the '
+                        'repo https://github.com/tensorflow/models and add '
+                        'tensorflow/models and tensorflow/models/research to '
+                        'the PYTHONPATH, and compile the protobufs by '
+                        'following https://github.com/tensorflow/models/blob/'
+                        'master/research/object_detection/g3doc/installation.md'
+                        '#protobuf-compilation')
+    assert self.supports_datasets()
+
+    glob_pattern = dataset.tf_record_pattern(subset)
+    ds = tf.data.TFRecordDataset.list_files(glob_pattern, shuffle=train)
+    # TODO(haoyuzhang): Enable map+filter fusion after cl/218399112 in release
+    # options = tf.data.Options()
+    # options.experimental_optimization = tf.data.experimental.OptimizationOptions()  # pylint: disable=line-too-long
+    # options.experimental_optimization.map_and_filter_fusion = True
+    # ds = ds.with_options(options)
+
+    ds = ds.apply(
+        tf.data.experimental.parallel_interleave(
+            tf.data.TFRecordDataset,
+            cycle_length=datasets_parallel_interleave_cycle_length or 10,
+            sloppy=datasets_sloppy_parallel_interleave))
+    mlperf.logger.log(key=mlperf.tags.INPUT_ORDER)
+    if datasets_repeat_cached_sample:
+      # Repeat a single sample element indefinitely to emulate memory-speed IO.
+      ds = ds.take(1).cache().repeat()
+    ds = ds.prefetch(buffer_size=batch_size)
+    if datasets_use_caching:
+      ds = ds.cache()
+    if train:
+      ds = ds.apply(tf.data.experimental.shuffle_and_repeat(buffer_size=10000))
+      mlperf.logger.log(key=mlperf.tags.INPUT_SHARD, value=10000)
+      mlperf.logger.log(key=mlperf.tags.INPUT_ORDER)
+    else:
+      ds = ds.repeat()
+
+    ds = ds.map(ssd_dataloader.ssd_parse_example_proto, num_parallel_calls=64)
+    ds = ds.filter(
+        lambda data: tf.greater(tf.shape(data['groundtruth_boxes'])[0], 0))
+    ds = ds.apply(
+        tf.data.experimental.map_and_batch(
+            map_func=self.preprocess,
+            batch_size=batch_size_per_split,
+            num_parallel_batches=num_splits,
+            drop_remainder=train))
+    ds = ds.prefetch(buffer_size=num_splits)
+    if num_threads:
+      ds = threadpool.override_threadpool(
+          ds,
+          threadpool.PrivateThreadPool(
+              num_threads, display_name='input_pipeline_thread_pool'))
+    return ds
+
+  def supports_datasets(self):
+    return True
 
 
-class TestImagePreprocessor(BaseImagePreprocess):
+class TestImagePreprocessor(BaseImagePreprocessor):
   """Preprocessor used for testing.
 
   set_fake_data() sets which images and labels will be output by minibatch(),
@@ -709,9 +1094,8 @@ class TestImagePreprocessor(BaseImagePreprocess):
   """
 
   def __init__(self,
-               height,
-               width,
                batch_size,
+               output_shapes,
                num_splits,
                dtype,
                train=None,
@@ -720,12 +1104,13 @@ class TestImagePreprocessor(BaseImagePreprocess):
                shift_ratio=0,
                summary_verbosity=0,
                distort_color_in_yiq=False,
-               fuse_decode_and_crop=False):
+               fuse_decode_and_crop=False,
+               match_mlperf=False):
     super(TestImagePreprocessor, self).__init__(
-        height, width, batch_size, num_splits, dtype, train, distortions,
+        batch_size, output_shapes, num_splits, dtype, train, distortions,
         resize_method, shift_ratio, summary_verbosity=summary_verbosity,
         distort_color_in_yiq=distort_color_in_yiq,
-        fuse_decode_and_crop=fuse_decode_and_crop)
+        fuse_decode_and_crop=fuse_decode_and_crop, match_mlperf=match_mlperf)
     self.expected_subset = None
 
   def set_fake_data(self, fake_images, fake_labels):
@@ -737,10 +1122,13 @@ class TestImagePreprocessor(BaseImagePreprocess):
     self.fake_images = fake_images
     self.fake_labels = fake_labels
 
-  def minibatch(self, dataset, subset, use_datasets, cache_data,
+  def minibatch(self,
+                dataset,
+                subset,
+                params,
                 shift_ratio=0):
     """Get test image batches."""
-    del dataset, use_datasets, cache_data
+    del dataset, params
     if (not hasattr(self, 'fake_images') or
         not hasattr(self, 'fake_labels')):
       raise ValueError('Must call set_fake_data() before calling minibatch '
@@ -773,5 +1161,159 @@ class TestImagePreprocessor(BaseImagePreprocess):
         images[split_index] = tf.parallel_stack(images[split_index])
         labels[split_index] = tf.parallel_stack(labels[split_index])
 
-      normalized = normalized_image(images)
-      return tf.cast(normalized, self.dtype), labels
+      normalized = [normalized_image(part) for part in images]
+      return [[tf.cast(part, self.dtype) for part in normalized], labels]
+
+
+class LibrispeechPreprocessor(InputPreprocessor):
+  """Preprocessor for librispeech class for all image model preprocessors."""
+
+  def __init__(self, batch_size, output_shapes, num_splits, dtype, train,
+               **kwargs):
+    del kwargs
+    super(LibrispeechPreprocessor, self).__init__(batch_size, output_shapes)
+    self.num_splits = num_splits
+    self.dtype = dtype
+    self.is_train = train
+    if self.batch_size % self.num_splits != 0:
+      raise ValueError(('batch_size must be a multiple of num_splits: '
+                        'batch_size %d, num_splits: %d') % (self.batch_size,
+                                                            self.num_splits))
+    self.batch_size_per_split = self.batch_size // self.num_splits
+
+  def create_dataset(self,
+                     batch_size,
+                     num_splits,
+                     batch_size_per_split,
+                     dataset,
+                     subset,
+                     train,
+                     datasets_repeat_cached_sample,
+                     num_threads=None,
+                     datasets_use_caching=False,
+                     datasets_parallel_interleave_cycle_length=None,
+                     datasets_sloppy_parallel_interleave=False,
+                     datasets_parallel_interleave_prefetch=None):
+    """Creates a dataset for the benchmark."""
+    # TODO(laigd): currently the only difference between this and the one in
+    # BaseImagePreprocessor is, this uses map() and padded_batch() while the
+    # latter uses tf.data.experimental.map_and_batch(). Try to merge them.
+    assert self.supports_datasets()
+    glob_pattern = dataset.tf_record_pattern(subset)
+    file_names = gfile.Glob(glob_pattern)
+    if not file_names:
+      raise ValueError('Found no files in --data_dir matching: {}'
+                       .format(glob_pattern))
+    ds = tf.data.TFRecordDataset.list_files(file_names, shuffle=train)
+    ds = ds.apply(
+        tf.data.experimental.parallel_interleave(
+            tf.data.TFRecordDataset,
+            cycle_length=datasets_parallel_interleave_cycle_length or 10,
+            sloppy=datasets_sloppy_parallel_interleave,
+            prefetch_input_elements=datasets_parallel_interleave_prefetch))
+    if datasets_repeat_cached_sample:
+      # Repeat a single sample element indefinitely to emulate memory-speed IO.
+      ds = ds.take(1).cache().repeat()
+    counter = tf.data.Dataset.range(batch_size)
+    counter = counter.repeat()
+    ds = tf.data.Dataset.zip((ds, counter))
+    ds = ds.prefetch(buffer_size=batch_size)
+    if datasets_use_caching:
+      ds = ds.cache()
+    if train:
+      ds = ds.apply(tf.data.experimental.shuffle_and_repeat(buffer_size=10000))
+    else:
+      ds = ds.repeat()
+    ds = ds.map(map_func=self.parse_and_preprocess,
+                num_parallel_calls=batch_size_per_split*num_splits)
+    ds = ds.padded_batch(
+        batch_size=batch_size_per_split,
+        padded_shapes=tuple([
+            tf.TensorShape(output_shape[1:])
+            for output_shape in self.output_shapes
+        ]),
+        drop_remainder=True)
+    ds = ds.prefetch(buffer_size=num_splits)
+    if num_threads:
+      ds = threadpool.override_threadpool(
+          ds,
+          threadpool.PrivateThreadPool(
+              num_threads, display_name='input_pipeline_thread_pool'))
+    return ds
+
+  def minibatch(self, dataset, subset, params, shift_ratio=-1):
+    assert params.use_datasets
+    # TODO(laigd): unify this with CNNModel's minibatch()
+    # TODO(laigd): in distributed mode we use shift_ratio so different workers
+    # won't work on same inputs, so we should respect that.
+    del shift_ratio
+    with tf.name_scope('batch_processing'):
+      ds = self.create_dataset(
+          self.batch_size,
+          self.num_splits,
+          self.batch_size_per_split,
+          dataset,
+          subset,
+          self.is_train,
+          datasets_repeat_cached_sample=params.datasets_repeat_cached_sample,
+          num_threads=params.datasets_num_private_threads,
+          datasets_use_caching=params.datasets_use_caching,
+          datasets_parallel_interleave_cycle_length=(
+              params.datasets_parallel_interleave_cycle_length),
+          datasets_sloppy_parallel_interleave=(
+              params.datasets_sloppy_parallel_interleave),
+          datasets_parallel_interleave_prefetch=(
+              params.datasets_parallel_interleave_prefetch))
+      ds_iterator = self.create_iterator(ds)
+
+      # The four lists are: input spectrogram feature, labels, input lengths,
+      # label lengths
+      input_lists = [[None for _ in range(self.num_splits)] for _ in range(4)]
+      for d in xrange(self.num_splits):
+        input_list = ds_iterator.get_next()
+        for i in range(4):
+          input_lists[i][d] = input_list[i]
+
+      assert self.output_shapes == [
+          input_lists[i][0].shape.as_list() for i in range(4)
+      ]
+      return tuple(input_lists)
+
+  def supports_datasets(self):
+    return True
+
+  def parse_and_preprocess(self, value, batch_position):
+    """Parse an TFRecord."""
+    del batch_position
+    assert self.supports_datasets()
+    context_features = {
+        'labels': tf.VarLenFeature(dtype=tf.int64),
+        'input_length': tf.FixedLenFeature([], dtype=tf.int64),
+        'label_length': tf.FixedLenFeature([], dtype=tf.int64),
+    }
+    sequence_features = {
+        'features': tf.FixedLenSequenceFeature([161], dtype=tf.float32)
+    }
+    context_parsed, sequence_parsed = tf.parse_single_sequence_example(
+        serialized=value,
+        context_features=context_features,
+        sequence_features=sequence_features,
+    )
+
+    return [
+        # Input
+        tf.expand_dims(sequence_parsed['features'], axis=2),
+        # Label
+        tf.cast(
+            tf.reshape(
+                tf.sparse_tensor_to_dense(context_parsed['labels']), [-1]),
+            dtype=tf.int32),
+        # Input length
+        tf.cast(
+            tf.reshape(context_parsed['input_length'], [1]),
+            dtype=tf.int32),
+        # Label length
+        tf.cast(
+            tf.reshape(context_parsed['label_length'], [1]),
+            dtype=tf.int32),
+    ]
